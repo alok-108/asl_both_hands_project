@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+.env
+hand_landmarker.task
+# We are tracking the .h5 model so it works out of the box for others

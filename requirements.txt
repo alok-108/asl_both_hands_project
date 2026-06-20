@@ -1,0 +1,8 @@
+streamlit
+opencv-python
+mediapipe
+numpy
+Pillow
+smart_gestures
+kagglehub
+tensorflow
