@@ -1,133 +1,105 @@
 import os
-import numpy as np
 import cv2
-import glob
-import urllib.request
+import numpy as np
+import mediapipe as mp
+import kagglehub
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Dropout
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-import kagglehub
+from tensorflow.keras.utils import to_categorical
 
-# Constants
-MODEL_NAME = "asl_hand_landmark_model.h5"
-X_NPY = "X.npy"
-Y_NPY = "y.npy"
+# Configuration
+DATASET_DIR = "asl_alphabet_train/asl_alphabet_train"
+MODEL_PATH_H5 = "asl_hand_landmark_model.h5"
+MODEL_PATH_TFLITE = "asl_hand_landmark_model.tflite"
+CLASSES = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") # 26 classes
 
-# ASL Alphabet 0-25 -> A-Z (Dataset includes 'del', 'nothing', 'space', we will filter for A-Z only)
-CLASSES = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+def download_dataset():
+    """Downloads dataset via kagglehub if not present."""
+    if not os.path.exists(DATASET_DIR):
+        print("Downloading Kaggle ASL Alphabet Dataset (87,000 images)... This may take a while.")
+        path = kagglehub.dataset_download("grassknoted/asl-alphabet")
+        global DATASET_DIR
+        DATASET_DIR = os.path.join(path, "asl_alphabet_train/asl_alphabet_train")
+        print(f"Dataset downloaded to {DATASET_DIR}")
+    else:
+        print("Dataset already found locally.")
 
-def get_hand_landmarker():
-    if not os.path.exists('hand_landmarker.task'):
-        print("Downloading hand_landmarker.task...")
-        urllib.request.urlretrieve(
-            'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task', 
-            'hand_landmarker.task'
-        )
-    base_options = python.BaseOptions(model_asset_path='hand_landmarker.task')
-    options = vision.HandLandmarkerOptions(
-        base_options=base_options,
-        num_hands=1, 
-        min_hand_detection_confidence=0.5
-    )
-    return vision.HandLandmarker.create_from_options(options)
-
-def extract_features(img_path, detector):
-    img = cv2.imread(img_path)
-    if img is None:
-        return None
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
-    detection_result = detector.detect(mp_image)
-    
-    if not detection_result.hand_landmarks:
-        return None
-        
-    landmarks = detection_result.hand_landmarks[0]
-    handedness = detection_result.handedness[0][0].category_name # "Left" or "Right"
-    
-    # 1. Shift wrist to (0,0)
-    wrist_x = landmarks[0].x
-    wrist_y = landmarks[0].y
+def process_landmarks(hand_landmarks, handedness):
+    """Normalize and format landmarks to a 63-element array (x, y, z)"""
+    wrist_x = hand_landmarks[0].x
+    wrist_y = hand_landmarks[0].y
+    wrist_z = hand_landmarks[0].z
     
     shifted = []
-    for lm in landmarks:
-        shifted.append([lm.x - wrist_x, lm.y - wrist_y])
+    for lm in hand_landmarks:
+        shifted.append([lm.x - wrist_x, lm.y - wrist_y, lm.z - wrist_z])
     shifted = np.array(shifted)
     
-    # 2. Scale by max distance to any point
+    # Scale by maximum Euclidean distance from wrist
     distances = np.linalg.norm(shifted, axis=1)
     max_dist = np.max(distances)
     if max_dist > 0:
         shifted = shifted / max_dist
         
-    # 3. If Left hand, flip x-coordinates to make it hand-agnostic
+    # Mirror x-coordinates for Left hand to make it hand-agnostic
     if handedness == "Left":
         shifted[:, 0] = -shifted[:, 0]
         
-    # 4. Flatten to 42-element vector
-    return shifted.flatten()
+    return shifted.flatten().astype(np.float32)
 
-def get_dataset_path():
-    # If a local folder exists, use it
-    if os.path.exists("asl_alphabet_train"):
-        # The dataset inside kaggle might be doubly nested
-        if os.path.exists(os.path.join("asl_alphabet_train", "asl_alphabet_train")):
-            return os.path.join("asl_alphabet_train", "asl_alphabet_train")
-        return "asl_alphabet_train"
-        
-    print("Local dataset not found. Downloading via kagglehub...")
-    # Downloads to kaggle cache directory
-    path = kagglehub.dataset_download("grassknoted/asl-alphabet")
+def extract_features():
+    """Extracts MediaPipe landmarks from dataset images and caches them."""
+    if os.path.exists("X.npy") and os.path.exists("y.npy"):
+        print("Loading cached features from X.npy and y.npy...")
+        X = np.load("X.npy")
+        y = np.load("y.npy")
+        return X, y
+
+    print("Extracting features using MediaPipe... (This will take a long time on 87,000 images)")
+    mp_hands = mp.solutions.hands
+    hands = mp_hands.Hands(static_image_mode=True, max_num_hands=1, min_detection_confidence=0.5)
     
-    dataset_dir = os.path.join(path, "asl_alphabet_train", "asl_alphabet_train")
-    if os.path.exists(dataset_dir):
-        return dataset_dir
-    return os.path.join(path, "asl_alphabet_train")
-
-def main():
-    # 1. Load or Generate Dataset
-    if os.path.exists(X_NPY) and os.path.exists(Y_NPY):
-        print("Loading cached dataset from .npy files...")
-        X = np.load(X_NPY)
-        y = np.load(Y_NPY)
-    else:
-        dataset_dir = get_dataset_path()
-        print(f"Extracting features from {dataset_dir}...")
-        detector = get_hand_landmarker()
-        X_list, y_list = [], []
-        
-        folders = os.listdir(dataset_dir)
-        for folder in folders:
-            if folder not in CLASSES:
+    X_list = []
+    y_list = []
+    
+    for label_idx, letter in enumerate(CLASSES):
+        folder_path = os.path.join(DATASET_DIR, letter)
+        if not os.path.exists(folder_path):
+            print(f"Warning: Directory {folder_path} not found. Skipping.")
+            continue
+            
+        print(f"Processing class {letter}...")
+        for filename in os.listdir(folder_path):
+            if not filename.endswith(".jpg"):
                 continue
-            class_idx = CLASSES.index(folder)
-            folder_path = os.path.join(dataset_dir, folder)
-            img_paths = glob.glob(os.path.join(folder_path, "*.jpg"))
+                
+            img_path = os.path.join(folder_path, filename)
+            image = cv2.imread(img_path)
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             
-            # Using subset of images if the dataset is massive, to speed up processing
-            # (There are 3000 images per class. 500 is more than enough for landmarks)
-            for img_path in img_paths[:500]: 
-                feat = extract_features(img_path, detector)
-                if feat is not None:
-                    X_list.append(feat)
-                    y_list.append(class_idx)
-            print(f"Processed class {folder}")
-            
-        X = np.array(X_list)
-        y = np.array(y_list)
-        print(f"Saving extracted features to {X_NPY} and {Y_NPY}...")
-        np.save(X_NPY, X)
-        np.save(Y_NPY, y)
-        
-    print(f"Dataset shape: X={X.shape}, y={y.shape}")
+            results = hands.process(image_rgb)
+            if results.multi_hand_landmarks:
+                hand_landmarks = results.multi_hand_landmarks[0]
+                handedness = results.multi_handedness[0].classification[0].label # Left/Right
+                
+                features = process_landmarks(hand_landmarks, handedness)
+                X_list.append(features)
+                y_list.append(label_idx)
+                
+    X = np.array(X_list, dtype=np.float32)
+    y = np.array(y_list, dtype=np.int32)
+    
+    np.save("X.npy", X)
+    np.save("y.npy", y)
+    print(f"Extracted features for {len(X)} images and cached them.")
+    return X, y
 
-    # 2. Train Model
-    print("Building and training model...")
+def train_and_convert_model(X, y):
+    """Trains a feed-forward NN and converts it to TFLite."""
+    print("Building and training the model...")
     model = Sequential([
-        Dense(128, activation='relu', input_shape=(42,)),
+        Dense(128, activation='relu', input_shape=(63,)),
         Dropout(0.2),
         Dense(64, activation='relu'),
         Dropout(0.2),
@@ -136,12 +108,31 @@ def main():
     
     model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     
-    # Train for at least 10 epochs
-    model.fit(X, y, epochs=15, batch_size=32, validation_split=0.2)
+    # Shuffle data
+    indices = np.arange(X.shape[0])
+    np.random.shuffle(indices)
+    X = X[indices]
+    y = y[indices]
     
-    # Save Model
-    model.save(MODEL_NAME)
-    print(f"Real model trained and saved to {MODEL_NAME}")
+    model.fit(X, y, epochs=15, batch_size=64, validation_split=0.2)
+    
+    # Save legacy .h5 model just in case
+    model.save(MODEL_PATH_H5)
+    print(f"Legacy model saved to {MODEL_PATH_H5}")
+    
+    # Convert to TFLite
+    print("Converting model to TFLite for production...")
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    tflite_model = converter.convert()
+    
+    with open(MODEL_PATH_TFLITE, 'wb') as f:
+        f.write(tflite_model)
+    print(f"Production TFLite model saved to {MODEL_PATH_TFLITE}!")
 
 if __name__ == "__main__":
-    main()
+    download_dataset()
+    X, y = extract_features()
+    if len(X) == 0:
+        print("No features extracted. Exiting.")
+    else:
+        train_and_convert_model(X, y)

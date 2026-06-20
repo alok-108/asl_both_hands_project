@@ -1,30 +1,43 @@
-# Real-Time ASL Alphabet Sign Language Detection with Both Hands
+# Real-Time ASL Alphabet Sign Language Detection (Production-Ready)
 
-A Streamlit application that detects and recognizes American Sign Language (ASL) alphabets in real-time. It uses MediaPipe to extract hand landmarks and prioritizes the open-source **`smart_gestures`** package to accurately classify the gestures.
+A robust, production-grade American Sign Language (ASL) alphabet (A-Z) recognition system. It uses your webcam to detect and classify gestures from both **left and right hands** simultaneously.
 
-## Features
-- Real-time webcam processing using Streamlit.
-- Support for **both Left and Right hands** independently. The model is hand-agnostic (using wrist-normalized and x-flipped coordinates for the left hand).
-- Automatically attempts to load the true ASL model from the `smart_gestures` PyPI package, requiring zero downloading of datasets or training!
-- If `smart_gestures` is unavailable, it gracefully falls back to a locally trained model (`asl_hand_landmark_model.h5`), and finally falls back to a dummy model to prevent crashes.
+## Key Technical Features
 
-## Setup Instructions
+1. **3D Depth Integration (Z-Axis):** Extracts 63 features per hand (`x`, `y`, `z` coordinates for 21 landmarks) to provide true depth context, greatly improving accuracy on overlapping gestures (like R, U, V).
+2. **TensorFlow Lite Engine:** Uses a `.tflite` model for blazing fast CPU inference, ensuring ultra-low latency real-time performance.
+3. **Temporal Smoothing:** Implements a rolling window mode filter (collections.deque) over consecutive frames to completely eliminate prediction flickering.
+4. **Hand-Agnostic Processing:** Horizontally mirrors left-hand X-coordinates during feature extraction, allowing a single neural network to process both hands interchangeably.
+5. **Confidence Scoring:** Extracts Softmax output probabilities to show real-time percentage confidence for every prediction.
 
-1. Install all dependencies:
+## Requirements
+
+- Python 3.9+
+- See `requirements.txt` for specific packages.
+
+## Quick Start
+
+1. **Install Dependencies:**
    ```bash
    pip install -r requirements.txt
    ```
-   *(This will attempt to install the `smart_gestures` package to provide the open-source model)*
-
-2. Run the Web App:
+2. **Generate the Model:**
+   Since this uses a custom 63-feature TFLite model, you must train it locally first. The script will automatically download the 87k ASL images from Kaggle and train the TFLite model.
+   ```bash
+   python train_model.py
+   ```
+3. **Run the App:**
    ```bash
    streamlit run app.py
    ```
-   *Streamlit will open in your default browser. Click the "Start Webcam" checkbox to begin real-time recognition.*
 
-## Custom Fallback Training
-If `smart_gestures` is not working for you and you wish to train your own local neural network using the massive Kaggle ASL Alphabet dataset:
-1. Run `python train_model.py`.
-2. If you don't have the dataset, the script will automatically download the 87,000 images using `kagglehub`!
-3. The script will cache the extracted landmarks into `X.npy` and `y.npy` to drastically speed up future runs, and it will train a feed-forward NN for at least 15 epochs.
-4. The final, real model will be saved as `asl_hand_landmark_model.h5`, which `app.py` will automatically detect and use as its secondary fallback.
+## Verification
+
+Run the test suite to ensure all components (Normalization, Smoothing, TFLite inference) are functioning correctly:
+```bash
+python check_project.py
+```
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

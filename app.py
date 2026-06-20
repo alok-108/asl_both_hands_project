@@ -5,19 +5,26 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import os
+import collections
+from statistics import mode
 
-# Try to import tensorflow for local fallbacks
+# Try to import tensorflow for TFLite
 try:
     import tensorflow as tf
-    from tensorflow.keras.models import load_model, Sequential
-    from tensorflow.keras.layers import Dense, Dropout
     TF_AVAILABLE = True
 except ImportError:
     TF_AVAILABLE = False
 
 # Configuration
-MODEL_PATH = "asl_hand_landmark_model.h5"
+MODEL_PATH = "asl_hand_landmark_model.tflite"
 CLASSES = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+SMOOTHING_FRAMES = 5  # Number of frames for temporal smoothing
+
+# Temporal Smoothing History (Tracked by Handedness)
+history = {
+    "Left": collections.deque(maxlen=SMOOTHING_FRAMES),
+    "Right": collections.deque(maxlen=SMOOTHING_FRAMES)
+}
 
 # Manual drawing connections
 HAND_CONNECTIONS = [
@@ -46,77 +53,51 @@ def load_detector():
     )
     return vision.HandLandmarker.create_from_options(options)
 
-class DummyModel:
-    def predict(self, features):
-        return [np.random.rand(26)]
-
 @st.cache_resource
-def load_asl_model():
-    """
-    Attempts to load models in this priority:
-    1. smart_gestures (PyPI package)
-    2. Local asl_hand_landmark_model.h5
-    3. Dummy Model (fallback)
-    """
-    status_msg = ""
-    model_source = "dummy"
-    
-    # 1. Try smart_gestures
+def load_tflite_model():
+    """Loads the TFLite model and allocates tensors."""
+    if not TF_AVAILABLE:
+        st.error("❌ TensorFlow is not installed. Please install it to use TFLite.")
+        st.stop()
+        
+    if not os.path.exists(MODEL_PATH):
+        st.error(f"❌ Model '{MODEL_PATH}' not found! Please run `python train_model.py` to generate it.")
+        st.stop()
+        
     try:
-        from smart_gestures import ASLModel
-        model = ASLModel.load_pretrained()
-        model_source = "smart_gestures"
-        return model, model_source, "Successfully loaded `smart_gestures` pre-trained model!"
-    except ImportError:
-        status_msg += "Could not import `smart_gestures`. "
+        interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+        interpreter.allocate_tensors()
+        
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        
+        return interpreter, input_details, output_details
     except Exception as e:
-        status_msg += f"Failed to load `smart_gestures` model: {e}. "
-        
-    # 2. Try Local .h5 Model
-    if TF_AVAILABLE and os.path.exists(MODEL_PATH):
-        try:
-            model = load_model(MODEL_PATH)
-            model_source = "local_h5"
-            return model, model_source, status_msg + f"Successfully loaded local `{MODEL_PATH}`!"
-        except Exception as e:
-            status_msg += f"Failed to load local .h5 model: {e}. "
-    elif not TF_AVAILABLE:
-        status_msg += "Tensorflow is not installed, cannot load local .h5 model. "
-    else:
-        status_msg += f"Local `{MODEL_PATH}` not found. "
-        
-    # 3. Fallback to Dummy Model
-    if TF_AVAILABLE:
-        model = Sequential([
-            Dense(128, activation='relu', input_shape=(42,)),
-            Dense(26, activation='softmax')
-        ])
-        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-    else:
-        model = DummyModel()
-        
-    status_msg += "Falling back to a DUMMY model with random predictions."
-    return model, "dummy", status_msg
+        st.error(f"❌ Failed to load TFLite model: {e}")
+        st.stop()
 
 def process_landmarks(hand_landmarks, handedness):
-    """Normalize and format landmarks to a 42-element array"""
+    """Normalize and format landmarks to a 63-element array (x, y, z)"""
     wrist_x = hand_landmarks[0].x
     wrist_y = hand_landmarks[0].y
+    wrist_z = hand_landmarks[0].z
     
     shifted = []
     for lm in hand_landmarks:
-        shifted.append([lm.x - wrist_x, lm.y - wrist_y])
+        shifted.append([lm.x - wrist_x, lm.y - wrist_y, lm.z - wrist_z])
     shifted = np.array(shifted)
     
+    # Scale by maximum Euclidean distance from wrist
     distances = np.linalg.norm(shifted, axis=1)
     max_dist = np.max(distances)
     if max_dist > 0:
         shifted = shifted / max_dist
         
+    # Mirror x-coordinates for Left hand to make it hand-agnostic
     if handedness == "Left":
         shifted[:, 0] = -shifted[:, 0]
         
-    return shifted.flatten()
+    return shifted.flatten().astype(np.float32)
 
 def draw_landmarks_and_box(image, landmarks, label):
     height, width, _ = image.shape
@@ -138,84 +119,86 @@ def draw_landmarks_and_box(image, landmarks, label):
     x2, y2 = min(width, max(x_coords) + 20), min(height, max(y_coords) + 20)
     
     cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 0), 4)
-    cv2.putText(image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
+
+def get_smoothed_prediction(handedness, prediction_idx, confidence):
+    """Applies temporal smoothing (mode filter) over the last N frames."""
+    history[handedness].append(prediction_idx)
+    
+    try:
+        # Find the most frequent prediction in recent frames
+        smoothed_idx = mode(history[handedness])
+    except:
+        # If there's a tie, fallback to the latest
+        smoothed_idx = prediction_idx
+        
+    predicted_letter = CLASSES[smoothed_idx]
+    return f"{handedness}: {predicted_letter} ({confidence:.0f}%)"
 
 def main():
-    st.title("ASL Alphabet Recognition – Both Hands")
+    st.set_page_config(page_title="ASL Both Hands", layout="wide")
+    st.title("Real-Time ASL Alphabet Recognition")
     
+    # Initialize Core Components
     detector = load_detector()
-    model, model_source, status_msg = load_asl_model()
+    interpreter, input_details, output_details = load_tflite_model()
     
     st.sidebar.title("Model Information")
-    st.sidebar.write("This application uses a fully **hand-agnostic** neural network. It can recognize signs whether you use your Left or Right hand!")
+    st.sidebar.success("✅ Powered by Production-Grade TFLite Model")
+    st.sidebar.write("- **Architecture:** 63-Feature (x, y, z depth)")
+    st.sidebar.write("- **Hand-Agnostic:** Yes")
+    st.sidebar.write(f"- **Temporal Smoothing:** {SMOOTHING_FRAMES} frames")
     st.sidebar.write("---")
     
-    if model_source == "smart_gestures":
-        st.sidebar.success("✅ Powered by `smart_gestures` open-source pre-trained model!")
-    elif model_source == "local_h5":
-        st.sidebar.info("✅ Powered by locally trained `asl_hand_landmark_model.h5`!")
-    else:
-        st.sidebar.error("❌ Running on Dummy Model!")
-        st.error(f"⚠️ **WARNING:** {status_msg}")
-        st.info("To make real predictions, run `pip install smart_gestures` (if available) OR run `python train_model.py` to train your own real model.")
-    
-    st.sidebar.write("---")
-    st.sidebar.write("Instructions:")
-    st.sidebar.write("1. Check 'Start Webcam'.")
-    st.sidebar.write("2. Make ASL alphabet gestures (A-Z).")
-    
-    run = st.checkbox('Start Webcam')
+    run = st.checkbox('Start Webcam', key='run_webcam')
     FRAME_WINDOW = st.empty()
     
-    if run:
-        cap = cv2.VideoCapture(0)
-        
-        while run:
-            ret, frame = cap.read()
-            if not ret:
-                st.error("Failed to read from webcam.")
-                break
-                
-            frame = cv2.flip(frame, 1)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-            
-            detection_result = detector.detect(mp_image)
-            
-            if detection_result.hand_landmarks:
-                for idx, hand_landmarks in enumerate(detection_result.hand_landmarks):
-                    handedness = detection_result.handedness[idx][0].category_name # "Left" or "Right"
-                    
-                    features = process_landmarks(hand_landmarks, handedness)
-                    
-                    if model_source == "smart_gestures":
-                        # Convert to format expected by smart_gestures
-                        # Assuming it expects the 42-element vector or can handle it directly.
-                        try:
-                            # Depending on package API, it might just return the letter directly
-                            prediction = model.predict(features)
-                            if isinstance(prediction, str):
-                                predicted_letter = prediction
-                            else:
-                                class_idx = np.argmax(prediction)
-                                predicted_letter = CLASSES[class_idx]
-                        except Exception:
-                            # Fallback if API differs slightly
-                            predicted_letter = "?"
-                    else:
-                        # Local or dummy Keras model
-                        prediction = model.predict(np.array([features]), verbose=0)
-                        class_idx = np.argmax(prediction[0])
-                        predicted_letter = CLASSES[class_idx]
-                    
-                    label_text = f"{handedness}: {predicted_letter}"
-                    draw_landmarks_and_box(frame_rgb, hand_landmarks, label_text)
-                    
-            FRAME_WINDOW.image(frame_rgb)
-            
-        cap.release()
-    else:
+    # Clear history when webcam is toggled to prevent artifacting from old sessions
+    if not run:
+        history["Left"].clear()
+        history["Right"].clear()
         st.write("Webcam is stopped.")
+        return
+
+    cap = cv2.VideoCapture(0)
+    
+    while run:
+        ret, frame = cap.read()
+        if not ret:
+            st.error("Failed to read from webcam.")
+            break
+            
+        frame = cv2.flip(frame, 1)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        
+        detection_result = detector.detect(mp_image)
+        
+        if detection_result.hand_landmarks:
+            for idx, hand_landmarks in enumerate(detection_result.hand_landmarks):
+                handedness = detection_result.handedness[idx][0].category_name # "Left" or "Right"
+                
+                # Extract 63-element feature vector (x, y, z)
+                features = process_landmarks(hand_landmarks, handedness)
+                
+                # Run TFLite Inference
+                interpreter.set_tensor(input_details[0]['index'], np.array([features]))
+                interpreter.invoke()
+                prediction = interpreter.get_tensor(output_details[0]['index'])[0]
+                
+                # Extract Confidence Score
+                class_idx = np.argmax(prediction)
+                confidence = prediction[class_idx] * 100
+                
+                # Temporal Smoothing
+                label_text = get_smoothed_prediction(handedness, class_idx, confidence)
+                
+                # Draw
+                draw_landmarks_and_box(frame_rgb, hand_landmarks, label_text)
+                
+        FRAME_WINDOW.image(frame_rgb)
+        
+    cap.release()
 
 if __name__ == "__main__":
     main()
